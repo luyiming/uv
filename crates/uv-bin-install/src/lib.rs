@@ -15,6 +15,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tracing::warn;
 use url::Url;
 use uv_distribution_filename::SourceDistExtension;
 
@@ -57,20 +58,47 @@ impl Binary {
         }
     }
 
-    /// Get the download URL for a specific version and platform.
-    pub fn download_url(
+    /// Get the ordered list of download URLs for a specific version and platform.
+    ///
+    /// The default Astral mirror is returned first, followed by the canonical GitHub URL as a
+    /// fallback.
+    pub fn download_urls(
         &self,
         version: &Version,
         platform: &str,
         format: ArchiveFormat,
-    ) -> Result<Url, Error> {
+    ) -> Result<Vec<Url>, Error> {
         match self {
             Self::Ruff => {
-                let url = format!(
-                    "https://github.com/astral-sh/ruff/releases/download/{version}/ruff-{platform}.{}",
-                    format.extension()
-                );
-                Url::parse(&url).map_err(|err| Error::UrlParse { url, source: err })
+                let suffix = format!("{version}/ruff-{platform}.{}", format.extension());
+                let canonical = format!("{RUFF_GITHUB_URL_PREFIX}{suffix}");
+                let mirror = format!("{RUFF_DEFAULT_MIRROR}{suffix}");
+                Ok(vec![
+                    Url::parse(&mirror).map_err(|err| Error::UrlParse {
+                        url: mirror,
+                        source: err,
+                    })?,
+                    Url::parse(&canonical).map_err(|err| Error::UrlParse {
+                        url: canonical,
+                        source: err,
+                    })?,
+                ])
+            }
+        }
+    }
+
+    /// Given a canonical artifact URL (e.g., from the versions manifest), return an ordered list
+    /// of URLs to try: the default Astral mirror first, then the canonical URL as a fallback.
+    fn mirror_urls(self, canonical_url: Url) -> Vec<Url> {
+        match self {
+            Self::Ruff => {
+                if let Some(suffix) = canonical_url.as_str().strip_prefix(RUFF_GITHUB_URL_PREFIX) {
+                    let mirror_str = format!("{RUFF_DEFAULT_MIRROR}{suffix}");
+                    if let Ok(mirror_url) = Url::parse(&mirror_str) {
+                        return vec![mirror_url, canonical_url];
+                    }
+                }
+                vec![canonical_url]
             }
         }
     }
@@ -154,6 +182,15 @@ impl fmt::Display for BinVersion {
     }
 }
 
+/// The canonical GitHub URL prefix for Ruff releases.
+const RUFF_GITHUB_URL_PREFIX: &str = "https://github.com/astral-sh/ruff/releases/download/";
+
+/// The default Astral mirror for Ruff releases.
+///
+/// This mirror is tried first for Ruff downloads. If it fails, uv falls back to the canonical
+/// GitHub URL.
+const RUFF_DEFAULT_MIRROR: &str = "https://releases.astral.sh/github/ruff/releases/download/";
+
 /// Base URL for the versions manifest.
 const VERSIONS_MANIFEST_URL: &str = "https://raw.githubusercontent.com/astral-sh/versions/main/v1";
 
@@ -187,15 +224,17 @@ struct BinArtifact {
 pub struct ResolvedVersion {
     /// The version number.
     pub version: Version,
-    /// The download URL for this version and current platform.
-    pub artifact_url: Url,
+    /// The ordered list of download URLs to try for this version and current platform.
+    ///
+    /// The default Astral mirror is listed first, with the canonical GitHub URL as a fallback.
+    pub artifact_urls: Vec<Url>,
     /// The archive format.
     pub archive_format: ArchiveFormat,
 }
 
 impl ResolvedVersion {
     /// Construct a [`ResolvedVersion`] from a [`Binary`] and a [`Version`] by inferring the
-    /// download URL and archive format from the current platform.
+    /// download URLs and archive format from the current platform.
     pub fn from_version(binary: Binary, version: Version) -> Result<Self, Error> {
         let platform = Platform::from_env()?;
         let platform_name = platform.as_cargo_dist_triple();
@@ -204,10 +243,10 @@ impl ResolvedVersion {
         } else {
             ArchiveFormat::TarGz
         };
-        let artifact_url = binary.download_url(&version, &platform_name, archive_format)?;
+        let artifact_urls = binary.download_urls(&version, &platform_name, archive_format)?;
         Ok(Self {
             version,
-            artifact_url,
+            artifact_urls,
             archive_format,
         })
     }
@@ -299,6 +338,18 @@ impl Error {
             return *retries;
         }
         0
+    }
+
+    /// Returns `true` if trying an alternative URL makes sense after this error.
+    ///
+    /// Network-level failures return `true`. Post-download errors (extraction failures, binary not
+    /// found) return `false` because switching to a different host would not fix them.
+    fn should_try_next_url(&self) -> bool {
+        match self {
+            Self::Download { .. } => true,
+            Self::RetriedError { err, .. } => err.should_try_next_url(),
+            _ => false,
+        }
     }
 }
 
@@ -399,6 +450,7 @@ async fn fetch_and_find_matching_version(
         }
         let version_info: BinVersionInfo = serde_json::from_str(line_str)?;
         Ok(check_version_match(
+            binary,
             &version_info,
             constraints,
             exclude_newer,
@@ -453,6 +505,7 @@ async fn fetch_and_find_matching_version(
 /// Returns `Some(resolved)` if the version matches and an artifact is found,
 /// `None` if the version doesn't match or no artifact is available for the platform.
 fn check_version_match(
+    binary: Binary,
     version_info: &BinVersionInfo,
     constraints: Option<&uv_pep440::VersionSpecifiers>,
     exclude_newer: Option<jiff::Timestamp>,
@@ -479,7 +532,7 @@ fn check_version_match(
             continue;
         }
 
-        let Ok(artifact_url) = Url::parse(&artifact.url) else {
+        let Ok(canonical_url) = Url::parse(&artifact.url) else {
             continue;
         };
 
@@ -491,7 +544,7 @@ fn check_version_match(
 
         return Some(ResolvedVersion {
             version: version_info.version.clone(),
-            artifact_url,
+            artifact_urls: binary.mirror_urls(canonical_url),
             archive_format,
         });
     }
@@ -511,10 +564,10 @@ pub async fn bin_install(
     let platform = Platform::from_env()?;
     let platform_name = platform.as_cargo_dist_triple();
 
-    bin_install_from_url(
+    bin_install_from_urls(
         binary,
         &resolved.version,
-        &resolved.artifact_url,
+        &resolved.artifact_urls,
         resolved.archive_format,
         &platform_name,
         client,
@@ -525,11 +578,11 @@ pub async fn bin_install(
     .await
 }
 
-/// Install a binary from a specific URL.
-async fn bin_install_from_url(
+/// Install a binary from an ordered list of URLs, trying each in sequence.
+async fn bin_install_from_urls(
     binary: Binary,
     version: &Version,
-    download_url: &Url,
+    download_urls: &[Url],
     format: ArchiveFormat,
     platform_name: &str,
     client: &BaseClient,
@@ -537,7 +590,6 @@ async fn bin_install_from_url(
     cache: &Cache,
     reporter: &dyn Reporter,
 ) -> Result<PathBuf, Error> {
-    let download_url = DisplaySafeUrl::from_url(download_url.clone());
     let cache_entry = CacheEntry::new(
         cache
             .bucket(CacheBucket::Binaries)
@@ -565,7 +617,7 @@ async fn bin_install_from_url(
         reporter,
         platform_name,
         format,
-        &download_url,
+        download_urls,
         &cache_entry,
     )
     .await?;
@@ -588,7 +640,11 @@ async fn bin_install_from_url(
     Ok(path)
 }
 
-/// Download and unpack a binary with retry on stream failures.
+/// Download and unpack a binary, trying each URL in sequence and retrying with backoff.
+///
+/// URLs are tried in order. If a network-level error occurs and there is a next URL to try, it
+/// falls back immediately without applying backoff. Backoff is only applied after all URLs have
+/// been exhausted.
 async fn download_and_unpack_with_retry(
     binary: Binary,
     version: &Version,
@@ -598,42 +654,61 @@ async fn download_and_unpack_with_retry(
     reporter: &dyn Reporter,
     platform_name: &str,
     format: ArchiveFormat,
-    download_url: &DisplaySafeUrl,
+    download_urls: &[Url],
     cache_entry: &CacheEntry,
 ) -> Result<PathBuf, Error> {
-    let mut retry_state = RetryState::start(*retry_policy, download_url.clone());
+    // Track retries against the last (canonical) URL so backoff is applied after all URLs fail.
+    let last_url = DisplaySafeUrl::from_url(
+        download_urls
+            .last()
+            .expect("download_urls must not be empty")
+            .clone(),
+    );
+    let mut retry_state = RetryState::start(*retry_policy, last_url);
 
-    loop {
-        let result = download_and_unpack(
-            binary,
-            version,
-            client,
-            cache,
-            reporter,
-            platform_name,
-            format,
-            download_url,
-            cache_entry,
-        )
-        .await;
-
-        match result {
-            Ok(path) => return Ok(path),
-            Err(err) => {
-                if let Some(backoff) = retry_state.should_retry(&err, err.retries()) {
-                    retry_state.sleep_backoff(backoff).await;
-                    continue;
+    'retry: loop {
+        for (i, url) in download_urls.iter().enumerate() {
+            let is_last = i == download_urls.len() - 1;
+            let display_url = DisplaySafeUrl::from_url(url.clone());
+            match download_and_unpack(
+                binary,
+                version,
+                client,
+                cache,
+                reporter,
+                platform_name,
+                format,
+                &display_url,
+                cache_entry,
+            )
+            .await
+            {
+                Ok(path) => return Ok(path),
+                Err(err) => {
+                    if !is_last && err.should_try_next_url() {
+                        let next_url = DisplaySafeUrl::from_url(download_urls[i + 1].clone());
+                        warn!(
+                            "Failed to download `{binary}` from {display_url} ({err}); falling back to {next_url}",
+                        );
+                        continue;
+                    }
+                    // All URLs exhausted; apply the retry policy.
+                    if let Some(backoff) = retry_state.should_retry(&err, err.retries()) {
+                        retry_state.sleep_backoff(backoff).await;
+                        continue 'retry;
+                    }
+                    return if retry_state.total_retries() > 0 {
+                        Err(Error::RetriedError {
+                            err: Box::new(err),
+                            retries: retry_state.total_retries(),
+                        })
+                    } else {
+                        Err(err)
+                    };
                 }
-                return if retry_state.total_retries() > 0 {
-                    Err(Error::RetriedError {
-                        err: Box::new(err),
-                        retries: retry_state.total_retries(),
-                    })
-                } else {
-                    Err(err)
-                };
             }
         }
+        unreachable!("download_urls must not be empty");
     }
 }
 
