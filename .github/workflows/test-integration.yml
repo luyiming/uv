@@ -652,6 +652,73 @@ jobs:
           .\uv.exe pip install --extra-index-url=$env:PYODIDE_INDEX --no-build numpy
           python -c 'import numpy'
 
+  integration-test-python-android:
+    name: "python on android"
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: "Install Android NDK"
+        run: sdkmanager "ndk;27.2.12479018"
+
+      - name: "Download binary"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: uv-linux-musl-${{ inputs.sha }}
+
+      - name: "Download Android Python"
+        run: |
+          mkdir -p android-python
+          curl -LsSf "https://www.python.org/ftp/python/3.14.3/python-3.14.3-x86_64-linux-android.tar.gz" | tar -xz -C android-python
+
+      - name: "Build Android Python launcher"
+        run: |
+          cat <<'C' > android-python/python-launcher.c
+          #include <Python.h>
+
+          int main(int argc, char **argv) {
+              return Py_BytesMain(argc, argv);
+          }
+          C
+
+          mkdir -p android-python/prefix/bin
+          "${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" \
+            android-python/python-launcher.c \
+            -Iandroid-python/prefix/include/python3.14 \
+            -Landroid-python/prefix/lib \
+            -lpython3.14 \
+            -o android-python/prefix/bin/python3
+          cp android-python/prefix/bin/python3 android-python/prefix/bin/python
+
+      - name: "Prepare Android runtime"
+        run: |
+          chmod +x ./uv
+          rm -rf android-runtime
+          mkdir -p android-runtime/prefix
+          cp ./uv android-runtime/uv
+          cp ./scripts/ci/android/check-uv-android.sh android-runtime/check-uv-android.sh
+          chmod +x android-runtime/check-uv-android.sh
+          rsync -aL ./android-python/prefix/ ./android-runtime/prefix/
+
+      - name: "Run Android integration checks"
+        uses: reactivecircus/android-emulator-runner@b530d96654c385303d652368551fb075bc2f0b6b # v2
+        with:
+          api-level: 32
+          arch: x86_64
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            adb wait-for-device
+            adb shell 'rm -rf /data/local/tmp/android-runtime'
+            adb push ./android-runtime /data/local/tmp/
+            adb shell 'chmod +x /data/local/tmp/android-runtime/uv /data/local/tmp/android-runtime/check-uv-android.sh /data/local/tmp/android-runtime/prefix/bin/python3 /data/local/tmp/android-runtime/prefix/bin/python'
+            adb shell 'cd /data/local/tmp/android-runtime && ./check-uv-android.sh'
+
   integration-test-github-actions:
     name: "github actions"
     timeout-minutes: 10
